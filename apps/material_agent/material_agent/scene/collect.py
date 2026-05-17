@@ -669,6 +669,50 @@ def _copy_materials_from_library(
             return f"/{scene_default_prim}"
         return lib_path
 
+    flattened_library_layer = None
+    flattened_lookup_attempted = False
+
+    def _source_layer_for_path(prim_path: str):
+        """Find the layer that can provide the material spec.
+
+        Material libraries sourced from USDZs or referenced USDs may expose
+        material prims only through stage composition.  The root Sdf.Layer does
+        not have specs at those composed paths, so fall back to copying from a
+        flattened composed stage.
+        """
+        nonlocal flattened_library_layer, flattened_lookup_attempted
+
+        if library_layer.GetPrimAtPath(prim_path):
+            return library_layer
+
+        if not flattened_lookup_attempted:
+            flattened_lookup_attempted = True
+            try:
+                from pxr import Usd
+
+                library_stage = Usd.Stage.Open(str(library_usd_path))
+                if library_stage:
+                    flattened_library_layer = library_stage.Flatten()
+            except Exception:
+                logger.debug(
+                    "Failed to flatten material library for composed lookup",
+                    exc_info=True,
+                )
+
+        if flattened_library_layer and flattened_library_layer.GetPrimAtPath(prim_path):
+            return flattened_library_layer
+        return None
+
+    def _type_material_scope_parent(parent_path: str, prim_spec: Sdf.PrimSpec) -> None:
+        """Type material namespace containers without changing scene prims."""
+        name = parent_path.rstrip("/").split("/")[-1]
+        if name not in {"Looks", "Materials"}:
+            return
+        if prim_spec.typeName:
+            return
+        prim_spec.typeName = "Scope"
+        logger.debug(f"Typed material scope parent as Scope: {parent_path}")
+
     # Build the path remapping for callers
     path_remap: dict[str, str] = {}
 
@@ -687,20 +731,29 @@ def _copy_materials_from_library(
             prim_spec = Sdf.CreatePrimInLayer(target_layer, parent_path)
             if prim_spec:
                 prim_spec.specifier = Sdf.SpecifierDef
+                _type_material_scope_parent(parent_path, prim_spec)
+        else:
+            prim_spec = target_layer.GetPrimAtPath(parent_path)
+            if prim_spec and prim_spec.specifier == Sdf.SpecifierDef:
+                _type_material_scope_parent(parent_path, prim_spec)
 
     # Copy each used material
     copied = 0
     for material_name, prim_path in used_materials.items():
-        source_spec = library_layer.GetPrimAtPath(prim_path)
-        if not source_spec:
+        source_layer = _source_layer_for_path(prim_path)
+        if not source_layer:
             logger.warning(
                 f"Material '{material_name}' not found at {prim_path} in library"
             )
             continue
+        if source_layer is not library_layer:
+            logger.info(
+                f"Material '{material_name}' found through library composition: {prim_path}"
+            )
 
         target = _target_path(prim_path)
         success = Sdf.CopySpec(
-            library_layer,
+            source_layer,
             Sdf.Path(prim_path),
             target_layer,
             Sdf.Path(target),

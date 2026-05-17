@@ -406,6 +406,10 @@ class TestDefaultPrimPreservation:
 
         output_layer = Sdf.Layer.FindOrOpen(str(output_usd))
         assert output_layer.defaultPrim == "World"
+        output_stage = Usd.Stage.Open(str(output_usd))
+        looks_prim = output_stage.GetPrimAtPath("/World/Looks")
+        assert looks_prim.IsValid()
+        assert looks_prim.GetTypeName() == "Scope"
 
     def test_full_stage_handles_no_default_prim(self, tmp_path):
         """_create_full_stage() auto-detects root prim when input has no defaultPrim."""

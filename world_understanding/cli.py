@@ -1088,6 +1088,7 @@ def flatten_usd(
     - .usd: Binary USD format (default)
     - .usda: ASCII USD format
     - .usdc: Crate USD format (binary)
+    Source files may also be USDZ packages.
 
     Examples:
         # Flatten to default name (scene_flat.usd)
@@ -1119,8 +1120,10 @@ def flatten_usd(
             console.print(f"[red]Error: Source file not found: {source}[/red]")
             raise typer.Exit(1)
 
-        valid_extensions = {".usd", ".usda", ".usdc"}
-        if source_path.suffix.lower() not in valid_extensions:
+        source_extensions = {".usd", ".usda", ".usdc", ".usdz"}
+        destination_extensions = {".usd", ".usda", ".usdc"}
+        source_ext = source_path.suffix.lower()
+        if source_ext not in source_extensions:
             console.print(
                 f"[red]Error: Unsupported source file extension: "
                 f"{source_path.suffix}[/red]"
@@ -1129,13 +1132,16 @@ def flatten_usd(
 
         # Default destination: <stem>_flat.<ext>
         if destination is None:
+            destination_suffix = (
+                ".usd" if source_ext == ".usdz" else source_path.suffix
+            )
             dest_path = source_path.with_name(
-                f"{source_path.stem}_flat{source_path.suffix}"
+                f"{source_path.stem}_flat{destination_suffix}"
             )
         else:
             dest_path = Path(destination)
 
-        if dest_path.suffix.lower() not in valid_extensions:
+        if dest_path.suffix.lower() not in destination_extensions:
             console.print(
                 f"[red]Error: Unsupported destination extension: "
                 f"{dest_path.suffix}[/red]"

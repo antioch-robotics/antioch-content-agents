@@ -7,19 +7,26 @@ This module defines the expected structure of the unified pipeline configuration
 
 from typing import Any
 
-from material_agent.api.defaults import (
-    DEFAULT_JUDGE_BACKEND,
-    DEFAULT_JUDGE_MAX_TOKENS,
-    DEFAULT_JUDGE_MODEL,
-    DEFAULT_JUDGE_REASONING_EFFORT,
-    DEFAULT_JUDGE_TEMPERATURE,
-    DEFAULT_VLM_BACKEND,
-    DEFAULT_VLM_LLMGATEWAY_CONFIG,
-    DEFAULT_VLM_MAX_TOKENS,
-    DEFAULT_VLM_MODEL,
-    DEFAULT_VLM_REASONING_EFFORT,
-    DEFAULT_VLM_TEMPERATURE,
-)
+DEFAULT_VLM_BACKEND = "nim"
+DEFAULT_VLM_MODEL = "qwen/qwen3.5-397b-a17b"
+DEFAULT_VLM_TEMPERATURE = 1.0
+DEFAULT_VLM_MAX_TOKENS = 24576
+DEFAULT_VLM_REASONING_EFFORT = "high"
+DEFAULT_VLM_LLMGATEWAY_CONFIG: dict[str, Any] = {
+    "cred_fields": [
+        "token_url",
+        "client_id",
+        "client_secret",
+        "scope",
+    ],
+    "env_prefix": "AZURE_LLM_GATEWAY_main_",
+    "cred_file_url": None,
+}
+DEFAULT_JUDGE_BACKEND = "llmgateway_azure_openai"
+DEFAULT_JUDGE_MODEL = "gpt-5"
+DEFAULT_JUDGE_TEMPERATURE = 1.0
+DEFAULT_JUDGE_MAX_TOKENS = 2048
+DEFAULT_JUDGE_REASONING_EFFORT = "high"
 
 # Step name to directory name mapping
 STEP_OUTPUT_DIRS = {

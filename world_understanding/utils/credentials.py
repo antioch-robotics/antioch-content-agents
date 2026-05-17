@@ -275,8 +275,9 @@ def get_openai_api_key_for_base_url(
     ``OPENAI_API_KEY``. Custom remote OpenAI-compatible endpoints require
     explicit config so provider credentials are not sent to arbitrary compatible
     services. Local endpoints may use the documented ``not-used`` dummy key only
-    when it is explicitly supplied in config, so authenticated private gateways
-    do not get silently treated as no-auth services.
+    when it is explicitly supplied in config or as the process ``OPENAI_API_KEY``.
+    This supports authenticated local relays that strip the dummy key and attach
+    their own upstream auth, such as Antioch's workspace-local Rome proxy.
 
     The check is performed against the *effective* base URL — when no
     ``base_url`` is supplied the OpenAI SDK falls back to ``OPENAI_BASE_URL``
@@ -311,12 +312,14 @@ def get_openai_api_key_for_base_url(
     openai_api_key = os.getenv("OPENAI_API_KEY")
     if not is_provider_endpoint:
         # Non-provider endpoints (local, custom remote, env-redirected) never
-        # silently inherit the hosted ``OPENAI_API_KEY``. The trust boundary
-        # for forwarding the hosted key is the OpenAI provider URL set —
-        # local servers, even when explicitly paired in config, must opt in
-        # via an endpoint-scoped ``api_key`` or the ``not-used`` no-auth
-        # placeholder. Callers like ``wu image-gen --base-url <local>``
-        # inject ``not-used`` after this returns ``None``.
+        # silently inherit a hosted ``OPENAI_API_KEY``. The trust boundary
+        # for forwarding a real hosted key is the OpenAI provider URL set.
+        # Local servers may opt into no-auth through the documented
+        # ``not-used`` placeholder in config or environment; authenticated
+        # local relays, such as Antioch's workspace-local Rome proxy, strip
+        # that dummy key before their own upstream hop.
+        if is_local_endpoint and is_local_nim_api_key_placeholder(openai_api_key):
+            return LOCAL_NIM_API_KEY_PLACEHOLDER
         return None
 
     if openai_api_key and not is_placeholder_api_key(openai_api_key):

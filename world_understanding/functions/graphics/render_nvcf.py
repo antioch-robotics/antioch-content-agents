@@ -23,6 +23,7 @@ from requests.exceptions import ConnectionError, HTTPError, RequestException, Ti
 
 from world_understanding.config.s3 import WU_S3_BUCKET, WU_S3_PROFILE, WU_S3_REGION
 
+from world_understanding.utils.data_uri import should_use_data_uri
 if TYPE_CHECKING:
     from pxr import Usd
 
@@ -66,6 +67,9 @@ _V2_SENSOR_TO_V1 = {
     "distance_to_camera": "linear_depth",
     "instance_segmentation": "instance_id_segmentation",
 }
+
+
+_DEFAULT_DATA_URI_BUNDLE_MAX_BYTES = 1024 * 1024 * 1024
 
 
 def _is_v2_response(result: dict[str, Any]) -> bool:
@@ -186,10 +190,73 @@ def _export_stage_and_get_url(
         return asset_url, s3_uri
 
 
+def _split_package_asset_path(asset_path: str) -> tuple[str, str] | None:
+    """Split ``outer.usdz[inner/file.png]`` package asset paths."""
+    if not asset_path.endswith("]") or "[" not in asset_path:
+        return None
+    package_path, inner_path = asset_path[:-1].rsplit("[", 1)
+    if not package_path or not inner_path:
+        return None
+    return package_path, inner_path
+
+
+def _asset_path_filename(asset_path: str) -> str:
+    package_parts = _split_package_asset_path(asset_path)
+    if package_parts:
+        return Path(package_parts[1]).name
+    return Path(asset_path).name
+
+
+def _local_texture_asset_size(asset: dict) -> int:
+    package_path = asset.get("package_path")
+    package_inner_path = asset.get("package_inner_path")
+    if package_path and package_inner_path:
+        try:
+            with zipfile.ZipFile(package_path, "r") as zf:
+                return zf.getinfo(package_inner_path).file_size
+        except Exception:
+            return 0
+
+    resolved_path = asset.get("resolved_path")
+    if not resolved_path:
+        return 0
+    try:
+        return Path(resolved_path).stat().st_size
+    except OSError:
+        return 0
+
+
+def _local_asset_bundle_size_bytes(
+    local_assets: list[dict], local_textures: list[dict]
+) -> int:
+    asset_bytes = 0
+    seen_paths: set[str] = set()
+
+    for asset in local_assets:
+        resolved_path = asset.get("resolved_path")
+        if not resolved_path or resolved_path in seen_paths:
+            continue
+        seen_paths.add(resolved_path)
+        try:
+            asset_bytes += Path(resolved_path).stat().st_size
+        except OSError:
+            continue
+
+    for texture in local_textures:
+        resolved_path = texture.get("resolved_path")
+        if not resolved_path or resolved_path in seen_paths:
+            continue
+        seen_paths.add(resolved_path)
+        asset_bytes += _local_texture_asset_size(texture)
+
+    return asset_bytes
+
+
 def _bundle_stage_with_local_assets(
     stage: "Usd.Stage",
     temp_dir: Path,
     base_dir: str | Path | None = None,
+    max_asset_bytes: int | None = None,
 ) -> tuple[Path | None, bool]:
     """Bundle USD stage with local MDL and texture assets into a ZIP archive.
 
@@ -226,6 +293,16 @@ def _bundle_stage_with_local_assets(
 
     if not local_assets and not local_textures:
         logger.info("No local MDL or texture assets found, skipping bundling")
+        return None, False
+
+    asset_bytes = _local_asset_bundle_size_bytes(local_assets, local_textures)
+    if max_asset_bytes is not None and asset_bytes > max_asset_bytes:
+        logger.warning(
+            "Local asset bundle estimated at %.1f MB, exceeding %.1f MB limit; "
+            "skipping bundling",
+            asset_bytes / (1024 * 1024),
+            max_asset_bytes / (1024 * 1024),
+        )
         return None, False
 
     logger.info(
@@ -274,6 +351,9 @@ def _bundle_stage_with_local_assets(
     # Track: resolved_path -> relative_path_in_bundle
     copied_textures: dict[str, str] = {}
 
+    # Track original authored asset path -> relative_path_in_bundle.
+    copied_texture_paths: dict[str, str] = {}
+
     if local_textures:
         textures_dir = bundle_dir / "textures"
         textures_dir.mkdir(parents=True, exist_ok=True)
@@ -283,9 +363,16 @@ def _bundle_stage_with_local_assets(
         for tex in local_textures:
             resolved = tex["resolved_path"]
             if resolved in copied_textures:
+                copied_texture_paths[tex["file_path"]] = copied_textures[resolved]
                 continue
 
-            src_path = Path(resolved)
+            package_path = tex.get("package_path")
+            package_inner_path = tex.get("package_inner_path")
+            if package_path and package_inner_path:
+                texture_name_source = package_inner_path
+            else:
+                texture_name_source = resolved
+            src_path = Path(texture_name_source)
             filename = src_path.name
 
             # Handle filename collisions
@@ -299,12 +386,19 @@ def _bundle_stage_with_local_assets(
 
             dest_path = textures_dir / filename
             try:
-                shutil.copy2(str(src_path), str(dest_path))
+                if package_path and package_inner_path:
+                    with zipfile.ZipFile(package_path, "r") as zf:
+                        with zf.open(package_inner_path) as src:
+                            with open(dest_path, "wb") as dst:
+                                shutil.copyfileobj(src, dst)
+                else:
+                    shutil.copy2(str(src_path), str(dest_path))
                 rel_path = str(dest_path.relative_to(bundle_dir))
                 copied_textures[resolved] = rel_path
-                logger.debug(f"Copied texture: {src_path} -> {dest_path}")
+                copied_texture_paths[tex["file_path"]] = rel_path
+                logger.debug(f"Copied texture: {resolved} -> {dest_path}")
             except Exception as e:
-                logger.warning(f"Failed to copy texture {src_path}: {e}")
+                logger.warning(f"Failed to copy texture {resolved}: {e}")
 
     if not copied_dirs and not copied_textures:
         logger.warning("No assets were copied, skipping bundling")
@@ -371,16 +465,23 @@ def _bundle_stage_with_local_assets(
                 if not copied_textures:
                     continue
 
-                # Match by filename against copied textures
-                asset_filename = Path(asset_path).name
-                for resolved, rel_bundle_path in copied_textures.items():
-                    if Path(resolved).name == asset_filename:
-                        attr_spec.default = Sdf.AssetPath(rel_bundle_path)
-                        updated_count += 1
-                        logger.debug(
-                            f"Updated texture path: {asset_path} -> {rel_bundle_path}"
-                        )
-                        break
+                rel_bundle_path = copied_texture_paths.get(asset_path)
+                if rel_bundle_path is None:
+                    # Match by filename against copied textures. Flattened USDZ
+                    # package paths look like ``file.usdz[SubUSDs/textures/a.png]``,
+                    # so use the inner package filename when present.
+                    asset_filename = _asset_path_filename(asset_path)
+                    for original_path, candidate in copied_texture_paths.items():
+                        if _asset_path_filename(original_path) == asset_filename:
+                            rel_bundle_path = candidate
+                            break
+
+                if rel_bundle_path is not None:
+                    attr_spec.default = Sdf.AssetPath(rel_bundle_path)
+                    updated_count += 1
+                    logger.debug(
+                        f"Updated texture path: {asset_path} -> {rel_bundle_path}"
+                    )
 
             # Process child prims
             for child in prim_spec.nameChildren:
@@ -418,7 +519,7 @@ def export_stage_to_s3(
     s3_bucket: str = WU_S3_BUCKET,
     s3_region: str = WU_S3_REGION,
     s3_profile: str = WU_S3_PROFILE,
-    use_data_uri: bool = False,
+    use_data_uri: bool | None = None,
     bundle_mdl_assets: bool = True,
     base_dir: str | Path | None = None,
 ) -> tuple[str, str | None]:
@@ -468,16 +569,29 @@ def export_stage_to_s3(
         >>> if s3_uri:
         ...     delete_s3_path(s3_uri, profile_name="your-aws-profile")
     """
+    use_data_uri = should_use_data_uri(use_data_uri)
+
     # Try bundling MDL assets if requested
     temp_dir = None
     zip_path = None
     was_bundled = False
 
-    if bundle_mdl_assets and not use_data_uri:
+    if bundle_mdl_assets:
         try:
             temp_dir = Path(tempfile.mkdtemp(prefix="nvcf_bundle_"))
+            max_asset_bytes = None
+            if use_data_uri:
+                max_asset_bytes = int(
+                    os.environ.get(
+                        "WU_NVCF_DATA_URI_BUNDLE_MAX_BYTES",
+                        str(_DEFAULT_DATA_URI_BUNDLE_MAX_BYTES),
+                    )
+                )
             zip_path, was_bundled = _bundle_stage_with_local_assets(
-                stage, temp_dir, base_dir=base_dir
+                stage,
+                temp_dir,
+                base_dir=base_dir,
+                max_asset_bytes=max_asset_bytes,
             )
         except Exception as e:
             logger.warning(f"MDL bundling failed, falling back to USD-only: {e}")
@@ -486,6 +600,17 @@ def export_stage_to_s3(
     if was_bundled and zip_path:
         # Upload the ZIP bundle
         try:
+            if use_data_uri:
+                asset_url, _s3_uri = _export_stage_and_get_url(
+                    stage_path=zip_path,
+                    use_data_uri=True,
+                    s3_bucket=s3_bucket,
+                    s3_profile=s3_profile,
+                    s3_region=s3_region,
+                )
+                logger.info("Created data URI for asset bundle")
+                return asset_url, None
+
             unique_id = uuid.uuid4().hex
             s3_key = f"nvcf-renders/{unique_id}/bundle.zip"
             s3_uri = upload_file_to_s3(
@@ -603,7 +728,7 @@ def render_single_camera(
     timeout: int = 3600,
     sensors: list[str] | None = None,
     apply_background_mask: bool = False,
-    use_data_uri: bool = False,
+    use_data_uri: bool | None = None,
     s3_bucket: str = WU_S3_BUCKET,
     s3_region: str = WU_S3_REGION,
     s3_profile: str = WU_S3_PROFILE,
@@ -683,6 +808,8 @@ def render_single_camera(
         >>> for i, img in enumerate(result['images']):
         ...     img.save(f"frame_{i}.png")
     """
+    use_data_uri = should_use_data_uri(use_data_uri)
+
     try:
         from pxr import Usd
     except ImportError as e:
@@ -1090,7 +1217,7 @@ def render_all_cameras(
     timeout: int = 3600,
     sensors: list[str] | None = None,
     apply_background_mask: bool = False,
-    use_data_uri: bool = False,
+    use_data_uri: bool | None = None,
     s3_bucket: str = WU_S3_BUCKET,
     s3_region: str = WU_S3_REGION,
     s3_profile: str = WU_S3_PROFILE,
@@ -1168,6 +1295,8 @@ def render_all_cameras(
         ... )
         >>> print(f"Rendered {result['successful_cameras']} cameras")
     """
+    use_data_uri = should_use_data_uri(use_data_uri)
+
     # Default camera if none specified
     if cameras is None or len(cameras) == 0:
         cameras = ["/Camera"]

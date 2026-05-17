@@ -179,6 +179,10 @@ def test_copy_materials_from_library_remaps_asset_paths(tmp_path: Path) -> None:
         scene_default_prim="Root",
     )
 
+    looks = target_layer.GetPrimAtPath("/Root/Looks")
+    assert looks is not None
+    assert looks.typeName == "Scope"
+
     shader = target_layer.GetPrimAtPath("/Root/Looks/Steel/Shader")
     assert shader is not None
     expected_rel = os.path.relpath(
@@ -189,6 +193,48 @@ def test_copy_materials_from_library_remaps_asset_paths(tmp_path: Path) -> None:
     arr_paths = [p.path for p in shader.attributes["extra_textures"].default]
     assert arr_paths[0].endswith("library/textures/a.png")
     assert arr_paths[1] == "/absolute/keep.png"
+
+
+def test_copy_materials_from_library_uses_composed_material_paths(
+    tmp_path: Path,
+) -> None:
+    library_dir = tmp_path / "library"
+    library_dir.mkdir()
+    referenced_usd = library_dir / "SM_Grass_1x1.usda"
+    ref_stage = Usd.Stage.CreateNew(str(referenced_usd))
+    ref_root = UsdGeom.Xform.Define(ref_stage, "/SM_Grass_1x1")
+    ref_stage.SetDefaultPrim(ref_root.GetPrim())
+    UsdGeom.Scope.Define(ref_stage, "/SM_Grass_1x1/Looks")
+    UsdShade.Material.Define(ref_stage, "/SM_Grass_1x1/Looks/Grass_Patterned")
+    ref_stage.GetRootLayer().Save()
+
+    library_usd = library_dir / "materials.usda"
+    stage = Usd.Stage.CreateNew(str(library_usd))
+    world = UsdGeom.Scope.Define(stage, "/World")
+    stage.SetDefaultPrim(world.GetPrim())
+    UsdGeom.Scope.Define(stage, "/World/Geometry")
+    grass = UsdGeom.Xform.Define(stage, "/World/Geometry/SM_Grass_1x4_4").GetPrim()
+    grass.GetReferences().AddReference(str(referenced_usd), "/SM_Grass_1x1")
+    stage.GetRootLayer().Save()
+
+    composed_path = "/World/Geometry/SM_Grass_1x4_4/Looks/Grass_Patterned"
+    library_layer = Sdf.Layer.FindOrOpen(str(library_usd))
+    assert library_layer is not None
+    assert library_layer.GetPrimAtPath(composed_path) is None
+    target_layer = Sdf.Layer.CreateAnonymous()
+    output_usd = tmp_path / "output" / "composed.usda"
+    output_usd.parent.mkdir(parents=True, exist_ok=True)
+    remap = _copy_materials_from_library(
+        target_layer,
+        library_usd,
+        {"Lawn Grass Patterned": composed_path},
+        output_usd,
+        scene_default_prim="Root",
+    )
+
+    target_path = "/Root/Geometry/SM_Grass_1x4_4/Looks/Grass_Patterned"
+    assert remap == {composed_path: target_path}
+    assert target_layer.GetPrimAtPath(target_path) is not None
 
 
 def test_process_payload_groups_creates_scoped_layers_and_payload_arcs(

@@ -10,8 +10,11 @@ asset classification without material-specific operations.
 from typing import Any
 
 from physics_agent.api.defaults import (
+    DEFAULT_SYSTEM_PROMPT,
+    DEFAULT_USER_PROMPT,
     DEFAULT_VLM_BACKEND,
     DEFAULT_VLM_LLMGATEWAY_CONFIG,
+    DEFAULT_VLM_IMAGE_PROMPTS,
     DEFAULT_VLM_MAX_TOKENS,
     DEFAULT_VLM_MODEL,
     DEFAULT_VLM_REASONING_EFFORT,
@@ -142,10 +145,9 @@ def get_step_defaults(step_name: str) -> dict[str, Any]:
             "include_prim_path_context": True,
             "include_geometric_context": True,
             "prompts": {
-                "vlm_image_prompts": {
-                    "composition": "This is an orthographic view of the object with the part of interest highlighted with an orange outline.",
-                    "prim_only": "This is a rendered part of interest only without highlighting.",
-                }
+                "system": DEFAULT_SYSTEM_PROMPT,
+                "user": DEFAULT_USER_PROMPT,
+                "vlm_image_prompts": DEFAULT_VLM_IMAGE_PROMPTS.copy(),
             },
         },
         "predict": {

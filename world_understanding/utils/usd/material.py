@@ -136,6 +136,16 @@ def get_unique_mdl_directories(mdl_assets: list[dict]) -> list[Path]:
 _TEXTURE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".exr", ".tga", ".hdr", ".bmp"}
 
 
+def _split_package_asset_path(asset_path: str) -> tuple[str, str] | None:
+    """Split ``outer.usdz[inner/file.png]`` package asset paths."""
+    if not asset_path.endswith("]") or "[" not in asset_path:
+        return None
+    package_path, inner_path = asset_path[:-1].rsplit("[", 1)
+    if not package_path or not inner_path:
+        return None
+    return package_path, inner_path
+
+
 def get_local_texture_file_assets(
     stage: Usd.Stage, base_dir: str | Path | None = None
 ) -> list[dict]:
@@ -159,6 +169,8 @@ def get_local_texture_file_assets(
             - file_path: Original file path as stored in the attribute
             - resolved_path: Resolved absolute path to the texture file, or None
             - is_local: True if the file exists locally
+            - package_path: Outer package path for ``file.usdz[inner]`` assets
+            - package_inner_path: Inner package member path for packaged assets
     """
     if base_dir is None:
         root_layer = stage.GetRootLayer()
@@ -189,13 +201,25 @@ def get_local_texture_file_assets(
             except Exception:
                 file_path = str(asset_val)
 
+            try:
+                resolved_asset_path = getattr(asset_val, "resolvedPath", "") or ""
+            except Exception:
+                resolved_asset_path = ""
+
             if not file_path:
                 continue
 
             # Check if extension is a known texture format
-            ext = Path(file_path).suffix.lower()
+            texture_file_path = file_path
+            package_parts_for_ext = _split_package_asset_path(texture_file_path)
+            if package_parts_for_ext:
+                texture_file_path = package_parts_for_ext[1]
+            ext = Path(texture_file_path).suffix.lower()
             if ext not in _TEXTURE_EXTENSIONS:
                 continue
+
+            package_path = None
+            package_inner_path = None
 
             # Skip remote URLs
             if file_path.startswith(("http://", "https://")):
@@ -205,6 +229,8 @@ def get_local_texture_file_assets(
                         "attr_name": attr.GetName(),
                         "file_path": file_path,
                         "resolved_path": None,
+                        "package_path": None,
+                        "package_inner_path": None,
                         "is_local": False,
                     }
                 )
@@ -214,11 +240,32 @@ def get_local_texture_file_assets(
             resolved_path = None
             is_local = False
 
-            if os.path.isabs(file_path):
+            package_parts = _split_package_asset_path(file_path)
+            if package_parts:
+                candidate_package_path, candidate_inner_path = package_parts
+                if os.path.exists(candidate_package_path):
+                    resolved_path = file_path
+                    is_local = True
+                    package_path = candidate_package_path
+                    package_inner_path = candidate_inner_path
+            elif os.path.isabs(file_path):
                 if os.path.exists(file_path):
                     resolved_path = str(Path(file_path).resolve())
                     is_local = True
-            else:
+            elif resolved_asset_path:
+                package_parts = _split_package_asset_path(resolved_asset_path)
+                if package_parts:
+                    candidate_package_path, candidate_inner_path = package_parts
+                    if os.path.exists(candidate_package_path):
+                        resolved_path = resolved_asset_path
+                        is_local = True
+                        package_path = candidate_package_path
+                        package_inner_path = candidate_inner_path
+                elif os.path.exists(resolved_asset_path):
+                    resolved_path = str(Path(resolved_asset_path).resolve())
+                    is_local = True
+
+            if resolved_path is None and not os.path.isabs(file_path):
                 candidate = base_dir / file_path
                 if candidate.exists():
                     resolved_path = str(candidate.resolve())
@@ -236,6 +283,8 @@ def get_local_texture_file_assets(
                     "attr_name": attr.GetName(),
                     "file_path": file_path,
                     "resolved_path": resolved_path,
+                    "package_path": package_path,
+                    "package_inner_path": package_inner_path,
                     "is_local": is_local,
                 }
             )

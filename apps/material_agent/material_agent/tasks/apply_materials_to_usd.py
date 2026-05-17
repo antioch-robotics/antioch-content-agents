@@ -561,6 +561,50 @@ class ApplyMaterialsToUSDTask(Task):
                     parts[0] = default_prim_name
                 return "/" + "/".join(parts)
 
+            flattened_library_layer = None
+            flattened_lookup_attempted = False
+
+            def _source_layer_for_path(lib_path: str):
+                """Find the layer that can provide the material spec.
+
+                Source USDZs and referenced material libraries can expose a
+                material at a composed stage path while the root Sdf.Layer has
+                no spec at that path.  In that case, copy from a flattened
+                composed library stage instead of treating the material as
+                missing.
+                """
+                nonlocal flattened_library_layer, flattened_lookup_attempted
+
+                if library_layer.GetPrimAtPath(lib_path):
+                    return library_layer
+
+                if not flattened_lookup_attempted:
+                    flattened_lookup_attempted = True
+                    try:
+                        library_stage = Usd.Stage.Open(str(library_path))
+                        if library_stage:
+                            flattened_library_layer = library_stage.Flatten()
+                    except Exception as e:
+                        self.listener.debug(
+                            f"Failed to flatten material library for composed lookup: {e}"
+                        )
+
+                if flattened_library_layer and flattened_library_layer.GetPrimAtPath(
+                    lib_path
+                ):
+                    return flattened_library_layer
+                return None
+
+            def _type_material_scope_parent(parent_path: str, prim_spec: Sdf.PrimSpec) -> None:
+                """Type material namespace containers without changing scene prims."""
+                name = parent_path.rstrip("/").split("/")[-1]
+                if name not in {"Looks", "Materials"}:
+                    return
+                if prim_spec.typeName:
+                    return
+                prim_spec.typeName = "Scope"
+                self.listener.debug(f"Typed material scope parent as Scope: {parent_path}")
+
             # Build remapped target paths
             target_materials: dict[str, tuple[str, str]] = {}
             for material_name, lib_path in resolved_materials.items():
@@ -589,19 +633,25 @@ class ApplyMaterialsToUSDTask(Task):
                 if prim_spec and prim_spec.specifier != Sdf.SpecifierDef:
                     prim_spec.specifier = Sdf.SpecifierDef
                     self.listener.debug(f"Created parent prim: {parent_path}")
+                if prim_spec and prim_spec.specifier == Sdf.SpecifierDef:
+                    _type_material_scope_parent(parent_path, prim_spec)
 
             # Copy each used material from library to output
             for material_name, (lib_path, target_path) in target_materials.items():
-                source_spec = library_layer.GetPrimAtPath(lib_path)
-                if not source_spec:
+                source_layer = _source_layer_for_path(lib_path)
+                if not source_layer:
                     self.listener.error(
                         f"Material prim not found in library for "
                         f"'{material_name}': {lib_path}"
                     )
                     continue
+                if source_layer is not library_layer:
+                    self.listener.info(
+                        f"Material '{material_name}' found through library composition: {lib_path}"
+                    )
 
                 success = Sdf.CopySpec(
-                    library_layer,
+                    source_layer,
                     Sdf.Path(lib_path),
                     output_layer,
                     Sdf.Path(target_path),

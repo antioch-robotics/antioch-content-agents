@@ -15,7 +15,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-from pxr import Sdf, Usd, UsdGeom, UsdShade
+from pxr import Gf, Sdf, Usd, UsdGeom, UsdShade
 from world_understanding.agentic.tasks import Task
 
 from texture_agent.functions.material_discovery import PrimTextureUnit
@@ -132,6 +132,30 @@ _MDL_TEXTURE_INPUT_MAP = {
     "specular_roughness_texture": "roughness",
     "metallic_texture": "metalness",
     "metalness_texture": "metalness",
+}
+
+
+_MDL_ALBEDO_TINT_INPUTS = (
+    "diffuse_tint",
+    "albedo_tint",
+    "base_color",
+    "base_color_constant",
+    "diffuse_color",
+    "diffuse_color_constant",
+)
+
+
+_USD_PREVIEW_TEXTURE_NAME_MAP = {
+    "albedo": "albedo",
+    "basecolor": "albedo",
+    "base_color": "albedo",
+    "diffuse": "albedo",
+    "color": "albedo",
+    "normal": "normal",
+    "roughness": "roughness",
+    "metallic": "metalness",
+    "metalness": "metalness",
+    "orm": "orm",
 }
 
 
@@ -390,6 +414,10 @@ def _override_mdl_texture_inputs(
                     continue
                 if _safe_set_typed_value(inp, type_name, new_path):
                     overridden += 1
+                    if channel == "albedo":
+                        _neutralize_mdl_albedo_tint_inputs(
+                            shader, mat_path, base
+                        )
                 continue
 
             if not base.lower().endswith("_texture"):
@@ -486,6 +514,117 @@ def _safe_set_typed_value(
         return False
 
 
+def _neutralize_mdl_albedo_tint_inputs(
+    shader: UsdShade.Shader,
+    mat_path: str,
+    texture_input_name: str,
+) -> None:
+    """Set authored albedo tint inputs to white after replacing albedo texture.
+
+    Some MDL materials multiply ``diffuse_texture`` by an authored tint color.
+    Unreal grass exports can carry a red ``diffuse_tint``; if Texture Agent
+    replaces only the image path, the generated green albedo remains visibly
+    red. Once a generated albedo map is authoritative, neutral tints preserve
+    the generated color.
+    """
+    neutralized: list[str] = []
+    for input_name in _MDL_ALBEDO_TINT_INPUTS:
+        tint_input = shader.GetInput(input_name)
+        if not tint_input:
+            continue
+
+        type_name = str(tint_input.GetTypeName())
+        try:
+            if type_name in {"color3f", "float3", "vector3f", "normal3f"}:
+                tint_input.Set(Gf.Vec3f(1.0, 1.0, 1.0))
+            elif type_name in {"color4f", "float4", "vector4f"}:
+                tint_input.Set(Gf.Vec4f(1.0, 1.0, 1.0, 1.0))
+            else:
+                continue
+        except Exception as err:
+            logger.warning(
+                "Failed to neutralize MDL tint input %s:%s after overriding %s: %s",
+                mat_path,
+                input_name,
+                texture_input_name,
+                err,
+            )
+            continue
+        neutralized.append(input_name)
+
+    if neutralized:
+        logger.info(
+            "Neutralized MDL albedo tint inputs for %s: %s",
+            mat_path,
+            ", ".join(neutralized),
+        )
+
+
+def _texture_channel_from_shader_name(shader_name: str) -> str | None:
+    normalized = shader_name.replace("-", "_").lower()
+    for token, channel in _USD_PREVIEW_TEXTURE_NAME_MAP.items():
+        if token in normalized:
+            return channel
+    return None
+
+
+def _override_usd_preview_texture_inputs(
+    stage: Usd.Stage,
+    mat_path: str,
+    channel_paths: dict[str, str],
+) -> int:
+    """Overwrite UsdPreviewSurface texture nodes with generated texture paths.
+
+    Unreal-exported materials often already have child ``UsdUVTexture`` shaders
+    named ``diffuseTexture`` / ``roughnessTexture`` / ``normalTexture`` wired
+    into a ``UsdPreviewSurface``. The OpenPBR-style attributes written on the
+    Material prim are not consumed by that existing network, so the renderer
+    keeps using the source texture files unless those shader inputs are also
+    updated.
+    """
+    mat_prim = stage.GetPrimAtPath(mat_path)
+    if not mat_prim.IsValid():
+        return 0
+
+    overridden = 0
+    for child in mat_prim.GetChildren():
+        if not child.IsA(UsdShade.Shader):
+            continue
+        shader = UsdShade.Shader(child)
+        shader_id = shader.GetIdAttr().Get()
+        if shader_id != "UsdUVTexture":
+            continue
+
+        channel = _texture_channel_from_shader_name(child.GetName())
+        if channel is None:
+            continue
+        texture_path = channel_paths.get(channel)
+        if not texture_path:
+            continue
+
+        file_input = shader.GetInput("file")
+        if file_input:
+            file_input.Set(Sdf.AssetPath(texture_path))
+        else:
+            shader.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(
+                Sdf.AssetPath(texture_path)
+            )
+
+        source_color_space = shader.GetInput("sourceColorSpace")
+        if source_color_space:
+            source_color_space.Set("sRGB" if channel == "albedo" else "raw")
+
+        overridden += 1
+
+    if overridden:
+        logger.info(
+            "Overrode %d UsdPreviewSurface texture inputs with new local textures for %s",
+            overridden,
+            mat_path,
+        )
+    return overridden
+
+
 def _apply_pbr_textures(
     stage: Usd.Stage,
     mat_path: str,
@@ -570,6 +709,8 @@ def _apply_pbr_textures(
         )
         channel_paths["metalness"] = str(metalness_path)
 
+    _override_usd_preview_texture_inputs(stage, mat_path, channel_paths)
+
     return _override_mdl_texture_inputs(
         stage, mat_path, channel_paths, usd_path, working_dir
     )
@@ -644,18 +785,22 @@ class ApplyTexturesTask(Task):
         if not stage:
             raise FileNotFoundError(f"Failed to open USD stage: {usd_path}")
 
-        # Group units by material for cloning decisions
+        # Group by material prim path, not display name. Large composed scenes
+        # can contain hundreds of distinct material prims with the same leaf
+        # name (for example, Unreal exports named "Grass_Patterned"), and
+        # per-material mode should direct-apply to each path instead of
+        # accidentally entering per-prim clone mode for duplicate names.
         units_by_material: dict[str, list[PrimTextureUnit]] = defaultdict(list)
         for unit in units:
             if unit.key in blended:
-                units_by_material[unit.material_info.name].append(unit)
+                units_by_material[unit.material_info.prim_path].append(unit)
 
         applied_count = 0
         mdl_inputs_overridden = 0
         mdl_inputs_cleared: list[str] = []
         mdl_inputs_localized: list[str] = []
 
-        for _mat_name, mat_units in units_by_material.items():
+        for _mat_path, mat_units in units_by_material.items():
             mat = mat_units[0].material_info
 
             if len(mat_units) == 1 and not mat_units[0].prim_path:
